@@ -76,11 +76,33 @@ def _setup_win32_dnd(render_window, on_file_callback) -> bool:
             return False
 
         WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_ssize_t,
-            ctypes.c_void_p, ctypes.c_uint,
-            ctypes.c_size_t,  ctypes.c_ssize_t,
+            ctypes.c_ssize_t,                           # LRESULT
+            ctypes.c_void_p,                            # HWND
+            ctypes.c_uint,                              # UINT  msg
+            ctypes.c_size_t,                            # WPARAM (unsigned ptr-size)
+            ctypes.c_ssize_t,                           # LPARAM (signed ptr-size)
         )
-        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+        # Set argtypes so ctypes uses 64-bit integers on 64-bit Windows
+        user32.GetWindowLongPtrW.restype  = ctypes.c_ssize_t
+        user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        user32.SetWindowLongPtrW.restype  = ctypes.c_ssize_t
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             WNDPROC]
+
+        user32.CallWindowProcW.restype  = ctypes.c_ssize_t
+        user32.CallWindowProcW.argtypes = [ctypes.c_ssize_t,   # lpPrevWndFunc
+                                           ctypes.c_void_p,    # hWnd
+                                           ctypes.c_uint,      # Msg
+                                           ctypes.c_size_t,    # wParam
+                                           ctypes.c_ssize_t]   # lParam
+
+        shell32.DragAcceptFiles.argtypes  = [ctypes.c_void_p, ctypes.c_bool]
+        shell32.DragQueryFileW.argtypes   = [ctypes.c_void_p, ctypes.c_uint,
+                                             ctypes.c_wchar_p, ctypes.c_uint]
+        shell32.DragQueryFileW.restype    = ctypes.c_uint
+        shell32.DragFinish.argtypes       = [ctypes.c_void_p]
 
         old_ptr = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
 
