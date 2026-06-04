@@ -371,7 +371,10 @@ class _FileListPanel:
         pd.SetPolys(cells)
         mapper = vtk.vtkPolyDataMapper2D()
         mapper.SetInputData(pd)
-        mapper.GetTransformCoordinate().SetCoordinateSystemToDisplay()
+        # GetTransformCoordinate() returns None until one is assigned; create it first
+        _coord = vtk.vtkCoordinate()
+        _coord.SetCoordinateSystemToDisplay()
+        mapper.SetTransformCoordinate(_coord)
         actor = vtk.vtkActor2D()
         actor.SetMapper(mapper)
         actor.GetProperty().SetColor(*rgb)
