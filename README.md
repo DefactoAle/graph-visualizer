@@ -13,6 +13,10 @@ in a GPU-accelerated VTK window.
 
 - **GPU-accelerated rendering** via PyVista / VTK (OpenGL) — smooth at any
   graph size
+- **Drag-and-drop** — drop a `.graph` file or folder onto the window to load it
+- **Folder scanning** — select a folder to scan for all `.graph` files and browse
+  them with Up/Down arrow keys (playlist mode)
+- **File/folder dialogs** — press `O` to open a file or `F` to open a folder
 - **Layer toggles** — show/hide Faces, Edges, Bend Edges, Vertices, Labels,
   and Bend Annotations independently with the checkboxes in the top-left corner
 - **Hover inspection** — move the mouse over any vertex or face panel to see
@@ -47,6 +51,18 @@ pip install "pyvista[all]" numpy
 
 ## Usage
 
+### GUI (double-click app launcher)
+
+On Windows, double-click **`launch.pyw`** to open the visualizer with a welcome
+screen. You can then:
+- Drag a `.graph` file or folder onto the window
+- Press **O** to open a file dialog
+- Press **F** to open a folder dialog (scans for all `.graph` files)
+
+When a folder is open, the right panel shows a playlist. Navigate with **Up/Down**.
+
+### Command-line
+
 ```bash
 # Basic
 python visualize_graph.py path/to/grafo.txt
@@ -54,7 +70,10 @@ python visualize_graph.py path/to/grafo.txt
 # With vertex ID labels
 python visualize_graph.py path/to/grafo.txt --labels
 
-# Default (looks for grafo.txt in the current directory)
+# Open folder (scans for .graph files)
+python visualize_graph.py path/to/folder
+
+# Default (shows welcome screen)
 python visualize_graph.py
 ```
 
@@ -62,21 +81,30 @@ python visualize_graph.py
 
 ## Controls
 
+### Mouse & Scroll
 | Action | Result |
 |--------|--------|
 | **Left-drag** | Orbit |
 | **Middle-drag** | Pan |
 | **Scroll** | Zoom |
-| **1** | Top view |
-| **2** | Front view |
-| **3** | Side view |
-| **4** | Isometric view (default) |
-| **5** | Back view |
-| **0** | Home (reset to iso) |
+| **Hover** | Inspect vertex / face under cursor |
+
+### Keyboard
+| Key | Result |
+|-----|--------|
+| **1–5, 0** | View presets (Top, Front, Side, Iso, Back, Home) |
 | **R** | Reset camera to fit |
 | **S** | Save screenshot as PNG |
-| **Hover** | Inspect vertex / face under cursor |
+| **O** | Open file dialog |
+| **F** | Open folder dialog |
+| **Up / Down** | Navigate playlist (when folder is open) |
+| **+/−** | Zoom in/out |
+
+### UI
+| Element | Result |
+|---------|--------|
 | **Top-left checkboxes** | Toggle layer visibility |
+| **Right panel** (in playlist mode) | File list with arrow navigation |
 
 ---
 
