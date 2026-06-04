@@ -3,20 +3,24 @@ Sheet Metal Graph Visualizer
 Reads a Salvagnini SMSerializer JSON file and renders the topological graph in 3D.
 
 Usage:
-    python visualize_graph.py [file] [--labels]
+    python visualize_graph.py [file] [--labels]   # CLI
+    python launch.pyw                              # double-click app (no console)
 
-    file     Path to the grafo.txt JSON file (default: grafo.txt)
+    file     Path to the grafo.txt JSON file. If omitted, a welcome screen opens
+             where you can drag a file onto the window or press O to browse.
+
     --labels Show vertex ID labels in the plot
 
 Controls:
     Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot
+           O = open file dialog
     Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom
     Top-left checkboxes: toggle layer visibility
     Hover over geometry to inspect elements
+    Drag a new graph file onto the window to reload
 """
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
@@ -208,8 +212,12 @@ def visualize(
     graph: SheetMetalGraph,
     title: str = "Sheet Metal Graph",
     show_labels: bool = False,
-) -> None:
+) -> Optional[str]:
+    """Render *graph* in a 3D window.  Returns a new file path if the user
+    drops a file onto the window to reload, or None if they just closed it."""
     import vtk  # bundled with pyvista[all]
+
+    _next_file: list[Optional[str]] = [None]
 
     pv.global_theme.background = "white"
     plotter = pv.Plotter(title=title, window_size=[_WIN_W, _WIN_H])
@@ -490,6 +498,32 @@ def visualize(
             _raw.AddObserver("MouseMoveEvent", _on_mouse_move)
 
     # ------------------------------------------------------------------ #
+    #  Drag-and-drop: drop a new file to reload                           #
+    # ------------------------------------------------------------------ #
+    def _get_iren():
+        iren = plotter.iren
+        return getattr(iren, "interactor", None) or getattr(iren, "_iren", None) or iren
+
+    try:
+        plotter.render_window.SetAcceptDrop(True)
+    except Exception:
+        pass
+
+    def _on_file_drop(obj, event):
+        try:
+            files = _get_iren().GetDroppedFiles()
+            if files and files.GetNumberOfValues() > 0:
+                _next_file[0] = files.GetValue(0).strip()
+                _get_iren().TerminateApp()
+        except Exception as exc:
+            print(f"Drop error: {exc}")
+
+    try:
+        _get_iren().AddObserver("DropFilesEvent", _on_file_drop)
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------ #
     #  View preset keyboard shortcuts                                      #
     # ------------------------------------------------------------------ #
     _VIEW_KEYS: dict[str, tuple] = {
@@ -515,6 +549,15 @@ def visualize(
         plotter.reset_camera()
 
     plotter.add_key_event("r", _reset_view)
+
+    def _on_open_file():
+        path = _open_file_dialog()
+        if path:
+            _next_file[0] = path
+            _get_iren().TerminateApp()
+
+    plotter.add_key_event("o", _on_open_file)
+    plotter.add_key_event("O", _on_open_file)
 
     # ------------------------------------------------------------------ #
     #  Screenshot (S key → PNG timestamped in working directory)          #
@@ -552,11 +595,18 @@ def visualize(
 
     print("\n--- Controls ---")
     print("  Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot")
+    print("         O=Open file")
     print("  Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom")
     print("  Hover over geometry to inspect elements (vertex coords, face info)")
     print("  Top-left checkboxes: toggle layer visibility")
+    print("  Drag a graph file onto the window to reload")
 
     plotter.show(auto_close=False)
+    try:
+        plotter.close()
+    except Exception:
+        pass
+    return _next_file[0]
 
 
 # ---------------------------------------------------------------------------
@@ -593,19 +643,114 @@ def _load_graph(path: str) -> SheetMetalGraph:
     return SheetMetalGraph.from_dict(graph_dict)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Visualize a Salvagnini SMSerializer sheet metal graph in 3D."
-    )
-    parser.add_argument(
-        "file", nargs="?", default="grafo.txt",
-        help="Path to the JSON graph file (default: grafo.txt)"
-    )
-    parser.add_argument(
-        "--labels", action="store_true",
-        help="Annotate each vertex with its ID"
-    )
-    args = parser.parse_args()
+def _open_file_dialog() -> Optional[str]:
+    """Open a native OS file picker; return selected path or None."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.askopenfilename(
+            title="Open Graph File",
+            filetypes=[
+                ("Graph files", "*.txt *.json"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        return path.strip() or None
+    except Exception:
+        return None
 
-    graph = _load_graph(args.file)
-    visualize(graph, title=args.file, show_labels=args.labels)
+
+def _welcome_screen() -> Optional[str]:
+    """Splash window shown when no file is provided at startup.
+    Returns the file path the user selected/dropped, or None if they quit."""
+    pv.global_theme.background = "#1C1C2E"
+    pl = pv.Plotter(
+        title="Sheet Metal Graph Visualizer",
+        window_size=[640, 400],
+    )
+    pl.enable_trackball_style()
+
+    pl.add_text(
+        "Sheet Metal Graph Visualizer",
+        position="upper_edge",
+        font_size=16,
+        color="white",
+        bold=True,
+    )
+    pl.add_text(
+        "Drop a graph file (.txt / .json) onto this window\n\n"
+        "Press  O  to browse for a file\n\n"
+        "Press  Q  to quit",
+        position="center",
+        font_size=12,
+        color="#AAAAAA",
+    )
+
+    result: list[Optional[str]] = [None]
+
+    def _get_iren():
+        iren = pl.iren
+        return getattr(iren, "interactor", None) or getattr(iren, "_iren", None) or iren
+
+    try:
+        pl.render_window.SetAcceptDrop(True)
+    except Exception:
+        pass
+
+    def _on_drop(obj, event):
+        try:
+            files = _get_iren().GetDroppedFiles()
+            if files and files.GetNumberOfValues() > 0:
+                result[0] = files.GetValue(0).strip()
+                _get_iren().TerminateApp()
+        except Exception as exc:
+            print(f"Drop error: {exc}")
+
+    try:
+        _get_iren().AddObserver("DropFilesEvent", _on_drop)
+    except Exception:
+        pass
+
+    def _on_open():
+        path = _open_file_dialog()
+        if path:
+            result[0] = path
+            _get_iren().TerminateApp()
+
+    pl.add_key_event("o", _on_open)
+    pl.add_key_event("O", _on_open)
+
+    pl.show(auto_close=False)
+    try:
+        pl.close()
+    except Exception:
+        pass
+
+    pv.global_theme.background = "white"
+    return result[0]
+
+
+def main() -> None:
+    import sys
+
+    show_labels = "--labels" in sys.argv
+    cli_files = [a for a in sys.argv[1:] if not a.startswith("-")]
+
+    path: Optional[str] = cli_files[0] if cli_files else _welcome_screen()
+
+    while path:
+        try:
+            graph = _load_graph(path)
+        except SystemExit as exc:
+            print(exc)
+            path = _welcome_screen()
+            continue
+        path = visualize(graph, title=path, show_labels=show_labels)
+
+
+if __name__ == "__main__":
+    main()
