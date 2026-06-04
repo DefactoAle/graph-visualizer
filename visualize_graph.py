@@ -963,6 +963,8 @@ def _pick_folder_dialog() -> Optional[str]:
 def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
     """Splash window shown when no file is provided at startup.
     Returns (first_path, playlist) — playlist is None for single files."""
+    import vtk as _vtk
+
     pv.global_theme.background = "#1C1C2E"
     pl = pv.Plotter(
         title="Sheet Metal Graph Visualizer",
@@ -970,14 +972,32 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
     )
     pl.enable_trackball_style()
 
-    pl.add_text("Sheet Metal Graph Visualizer",
-                position="upper_edge", font_size=16, color="white")
-    pl.add_text(
+    # Title — centred via vtkTextActor so justification is exact
+    _ta = _vtk.vtkTextActor()
+    _ta.SetInput("Sheet Metal Graph Visualizer")
+    _ta.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
+    _ta.SetPosition(0.5, 0.82)
+    _tp2 = _ta.GetTextProperty()
+    _tp2.SetFontSize(18)
+    _tp2.SetColor(1.0, 1.0, 1.0)
+    _tp2.SetJustificationToCentered()
+    _tp2.SetBold(True)
+    pl.renderer.AddActor2D(_ta)
+
+    # Instructions — centred, placed in the lower half of the window
+    _ia = _vtk.vtkTextActor()
+    _ia.SetInput(
         "Drop a .graph file or folder onto this window\n\n"
-        "Press  O  to open a file   |   F  to open a folder\n\n"
-        "Press  Q  to quit",
-        position="lower_edge", font_size=12, color="#AAAAAA",
+        "O  =  open file        F  =  open folder\n\n"
+        "Q  =  quit"
     )
+    _ia.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
+    _ia.SetPosition(0.5, 0.28)
+    _ip = _ia.GetTextProperty()
+    _ip.SetFontSize(12)
+    _ip.SetColor(0.67, 0.67, 0.67)
+    _ip.SetJustificationToCentered()
+    pl.renderer.AddActor2D(_ia)
 
     result_path:     list[Optional[str]]        = [None]
     result_playlist: list[Optional[list[str]]]  = [None]
