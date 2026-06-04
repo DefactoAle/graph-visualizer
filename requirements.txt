@@ -1,0 +1,2 @@
+pyvista[all]>=0.44
+numpy>=1.21
