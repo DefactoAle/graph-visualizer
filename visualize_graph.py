@@ -3,21 +3,23 @@ Sheet Metal Graph Visualizer
 Reads a Salvagnini SMSerializer JSON file and renders the topological graph in 3D.
 
 Usage:
-    python visualize_graph.py [file] [--labels]   # CLI
-    python launch.pyw                              # double-click app (no console)
+    python visualize_graph.py [file_or_folder] [--labels]   # CLI
+    python launch.pyw                                        # double-click app (no console)
 
-    file     Path to the grafo.txt JSON file. If omitted, a welcome screen opens
-             where you can drag a file onto the window or press O to browse.
+    file_or_folder  Path to a .graph/.txt/.json file, or a folder containing .graph
+                    files.  If omitted, a welcome screen opens where you can drag a
+                    file or folder onto the window or press O to browse.
 
-    --labels Show vertex ID labels in the plot
+    --labels  Show vertex ID labels in the plot
 
 Controls:
     Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot
-           O = open file dialog
+           O = open file / folder dialog
+           Up / Down = navigate playlist (when a folder is open)
     Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom
     Top-left checkboxes: toggle layer visibility
     Hover over geometry to inspect elements
-    Drag a new graph file onto the window to reload
+    Drag a file or folder onto the window to reload / open playlist
 """
 from __future__ import annotations
 
@@ -267,6 +269,16 @@ def _extract_face_polygon(
     return [], False
 
 
+def _scan_folder(folder: str) -> list[str]:
+    """Recursively find all .graph files under *folder*, sorted by path."""
+    matches: list[str] = []
+    for root, _dirs, files in os.walk(folder):
+        for f in sorted(files):
+            if f.lower().endswith(".graph"):
+                matches.append(os.path.join(root, f))
+    return matches
+
+
 # ---------------------------------------------------------------------------
 # Layer 3: Renderer (PyVista / VTK – GPU-accelerated)
 # ---------------------------------------------------------------------------
@@ -274,179 +286,360 @@ def _extract_face_polygon(
 _WIN_W, _WIN_H = 1400, 900  # render window size in pixels
 
 
+class _FileListPanel:
+    """Right-side scrollable file list shown when a playlist is active."""
+
+    PANEL_W  = 250   # panel width in pixels
+    ITEM_H   = 20    # height per item row
+    HEADER_H = 32    # header area height
+    PAD      = 8     # left padding for text
+    MAX_VIS  = 30    # maximum simultaneously visible items
+
+    def __init__(self, renderer, vtk_mod, files: list[str],
+                 idx: int, win_w: int, win_h: int) -> None:
+        self._r     = renderer
+        self._vtk   = vtk_mod
+        self.files  = files
+        self.idx    = max(0, min(idx, len(files) - 1))
+        self._scroll = 0
+        self._n_vis = min(len(files), self.MAX_VIS)
+        self._actors:      list = []
+        self._item_actors: list = []
+
+        margin    = 10
+        self._x1  = win_w - self.PANEL_W - margin
+        self._x2  = win_w - margin
+        self._y2  = win_h - 95                                          # top edge
+        self._y1  = (self._y2
+                     - self.HEADER_H
+                     - self._n_vis * self.ITEM_H
+                     - 22)                                               # bottom edge
+
+        self._build()
+        self._refresh()
+
+    # ------------------------------------------------------------------ helpers
+
+    def _rect(self, x1: float, y1: float, x2: float, y2: float,
+              rgb: tuple, alpha: float = 1.0):
+        vtk = self._vtk
+        pts = vtk.vtkPoints()
+        for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
+            pts.InsertNextPoint(x, y, 0.0)
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(4)
+        for i in range(4):
+            cells.InsertCellPoint(i)
+        pd = vtk.vtkPolyData()
+        pd.SetPoints(pts)
+        pd.SetPolys(cells)
+        mapper = vtk.vtkPolyDataMapper2D()
+        mapper.SetInputData(pd)
+        mapper.GetTransformCoordinate().SetCoordinateSystemToDisplay()
+        actor = vtk.vtkActor2D()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*rgb)
+        actor.GetProperty().SetOpacity(alpha)
+        self._r.AddActor2D(actor)
+        self._actors.append(actor)
+        return actor
+
+    def _text(self, label: str, x: float, y: float,
+              size: int, rgb: tuple) -> object:
+        a = self._vtk.vtkTextActor()
+        a.SetInput(label)
+        a.GetPositionCoordinate().SetCoordinateSystemToDisplay()
+        a.SetPosition(x, y)
+        tp = a.GetTextProperty()
+        tp.SetFontSize(size)
+        tp.SetColor(*rgb)
+        self._r.AddActor2D(a)
+        self._actors.append(a)
+        return a
+
+    # ------------------------------------------------------------------ build
+
+    def _build(self) -> None:
+        # Dark background panel
+        self._rect(self._x1, self._y1, self._x2, self._y2,
+                   (0.11, 0.13, 0.22), alpha=0.91)
+        # Thin accent line below header
+        sep_y = self._y2 - self.HEADER_H
+        self._rect(self._x1, sep_y - 1, self._x2, sep_y,
+                   (0.28, 0.44, 0.78))
+        # Header text
+        self._text(
+            f"  Graph Files  ({len(self.files)})",
+            self._x1, self._y2 - self.HEADER_H + 9,
+            11, (0.80, 0.90, 1.00),
+        )
+        # Item slots (one text actor per visible row)
+        for _ in range(self._n_vis):
+            a = self._vtk.vtkTextActor()
+            a.GetPositionCoordinate().SetCoordinateSystemToDisplay()
+            a.GetTextProperty().SetFontSize(10)
+            self._r.AddActor2D(a)
+            self._item_actors.append(a)
+            self._actors.append(a)
+        # Navigation hint at bottom
+        self._text(
+            "  [^] [v] navigate",
+            self._x1, self._y1 + 4,
+            9, (0.38, 0.50, 0.65),
+        )
+
+    # ------------------------------------------------------------------ state
+
+    def _item_y(self, slot: int) -> float:
+        """Bottom-left y pixel of item row *slot* (0 = top row)."""
+        return self._y2 - self.HEADER_H - (slot + 1) * self.ITEM_H + 3
+
+    def _refresh(self) -> None:
+        """Recompute scroll offset and repaint all item actors."""
+        if self.idx < self._scroll:
+            self._scroll = self.idx
+        elif self.idx >= self._scroll + self._n_vis:
+            self._scroll = max(0, self.idx - self._n_vis + 1)
+
+        for slot, actor in enumerate(self._item_actors):
+            fi = self._scroll + slot
+            if fi >= len(self.files):
+                actor.SetInput("")
+                continue
+            name = os.path.basename(self.files[fi])
+            if len(name) > 29:
+                name = name[:27] + ".."
+            selected = (fi == self.idx)
+            actor.SetInput(f"  {'> ' if selected else '  '}{name}")
+            actor.SetPosition(self._x1, self._item_y(slot))
+            tp = actor.GetTextProperty()
+            if selected:
+                tp.SetColor(1.0, 1.0, 1.0)
+                tp.SetBackgroundColor(0.18, 0.38, 0.78)
+                tp.SetBackgroundOpacity(0.88)
+                tp.SetBold(True)
+            else:
+                tp.SetColor(0.68, 0.82, 0.96)
+                tp.SetBackgroundOpacity(0.0)
+                tp.SetBold(False)
+
+    def select(self, idx: int) -> None:
+        """Move selection to *idx* and repaint."""
+        self.idx = max(0, min(idx, len(self.files) - 1))
+        self._refresh()
+
+    def remove(self) -> None:
+        """Remove all panel actors from the renderer."""
+        for a in self._actors:
+            try:
+                self._r.RemoveActor2D(a)
+            except Exception:
+                pass
+        self._actors.clear()
+        self._item_actors.clear()
+
+
 def visualize(
     graph: SheetMetalGraph,
     title: str = "Sheet Metal Graph",
     show_labels: bool = False,
-) -> Optional[str]:
-    """Render *graph* in a 3D window.  Returns a new file path if the user
-    drops a file onto the window to reload, or None if they just closed it."""
-    import vtk  # bundled with pyvista[all]
+    playlist: Optional[list[str]] = None,
+    playlist_idx: int = 0,
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Render *graph* in a 3D window.
 
-    _next_file: list[Optional[str]] = [None]
+    If *playlist* is provided the right-side panel is shown and Up/Down
+    arrows navigate through files in-place (no window close/reopen).
+
+    Returns (next_path, next_playlist) when the user drops / opens a new
+    file or folder, or (None, None) when they just close the window.
+    """
+    import vtk
+
+    _next_file:     list[Optional[str]]             = [None]
+    _next_playlist: list[Optional[list[str]]]       = [None]
+    _cur_graph:     list[SheetMetalGraph]            = [graph]
 
     pv.global_theme.background = "white"
-    plotter = pv.Plotter(title=title, window_size=[_WIN_W, _WIN_H])
-    plotter.enable_trackball_style()  # CAD-style: left-drag=orbit, middle=pan, scroll=zoom
+    plotter = pv.Plotter(title="Sheet Metal Graph Visualizer",
+                         window_size=[_WIN_W, _WIN_H])
+    plotter.enable_trackball_style()
 
+    # Actors dict — checkbox callbacks close over the *lists* so we always
+    # clear() in-place on rebuild (never reassign the list references).
     actors: dict[str, list] = {
         "faces": [], "edges": [], "bend_edges": [],
         "vertices": [], "labels": [], "bend_annots": [],
     }
-    bad_faces: list[int] = []
-    bend_eids = graph.bend_edge_ids
+    _lbl_actors: list = []   # add_point_labels actors removed manually on rebuild
 
     # ------------------------------------------------------------------ #
-    #  Faces                                                               #
+    #  Updatable title actor                                              #
     # ------------------------------------------------------------------ #
-    face_pts_all: list = []
-    face_cells_all: list[int] = []
-    face_id_per_pt: list[int] = []
-    face_id_per_cell: list[int] = []
-    pt_offset = 0
+    _title_actor = vtk.vtkTextActor()
+    _title_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
+    _title_actor.SetPosition(0.5, 0.975)
+    _tp = _title_actor.GetTextProperty()
+    _tp.SetFontSize(10)
+    _tp.SetColor(0.0, 0.0, 0.0)
+    _tp.SetJustificationToCentered()
+    plotter.renderer.AddActor2D(_title_actor)
 
-    for face_id in graph.lamina_face_edges:
-        poly, is_valid = _extract_face_polygon(graph, face_id)
-        if is_valid and len(poly) >= 3:
-            n = len(poly)
-            face_pts_all.extend(poly)
-            face_id_per_pt.extend([face_id] * n)
-            face_cells_all.extend([n] + list(range(pt_offset, pt_offset + n)))
-            face_id_per_cell.append(face_id)
-            pt_offset += n
-        elif not is_valid:
-            bad_faces.append(face_id)
-
-    if face_pts_all:
-        face_mesh = pv.PolyData(
-            np.array(face_pts_all, dtype=float),
-            np.array(face_cells_all, dtype=int),
+    def _set_title(g: SheetMetalGraph, path: str) -> None:
+        nv  = len(g.vertices)
+        ne  = len(g.edges)
+        nb  = len(g.bend_angles)
+        nf  = len(g.coarse_face_lfaces)
+        nlf = len(g.lamina_face_edges)
+        _title_actor.SetInput(
+            f"{os.path.basename(path)}  |  "
+            f"{nv}V  {ne}E  {nb} bends  {nf} faces ({nlf} laminas)"
         )
-        face_mesh.point_data["face_id"] = np.array(face_id_per_pt, dtype=int)
-        # Per-cell scalar drives the color cycling (8 pastel shades)
-        face_mesh.cell_data["color_key"] = np.array(
-            [fid % 8 for fid in face_id_per_cell], dtype=float
-        )
-        actor = plotter.add_mesh(
-            face_mesh,
-            scalars="color_key",
-            cmap="Pastel1",
-            show_scalar_bar=False,
-            opacity=0.75,
-            show_edges=False,
-            lighting=True,
-            pickable=True,
-            name="faces",
-            clim=[0, 7],
-        )
-        actors["faces"].append(actor)
 
     # ------------------------------------------------------------------ #
-    #  Edges                                                               #
+    #  Hover text actor (created early so _build_graph can reset it)     #
     # ------------------------------------------------------------------ #
-    reg_pts: list = []
-    reg_lines: list[int] = []
-    bend_pts: list = []
-    bend_lines: list[int] = []
-
-    for eid, (v1, v2) in graph.edges.items():
-        if v1 not in graph.vertices or v2 not in graph.vertices:
-            continue
-        p1 = list(graph.vertices[v1])
-        p2 = list(graph.vertices[v2])
-        if eid in bend_eids:
-            i = len(bend_pts)
-            bend_pts.extend([p1, p2])
-            bend_lines.extend([2, i, i + 1])
-        else:
-            i = len(reg_pts)
-            reg_pts.extend([p1, p2])
-            reg_lines.extend([2, i, i + 1])
-
-    if reg_pts:
-        mesh = pv.PolyData(np.array(reg_pts, dtype=float))
-        mesh.lines = np.array(reg_lines, dtype=int)
-        actor = plotter.add_mesh(
-            mesh, color="#555555", line_width=1.5, pickable=False, name="edges"
-        )
-        actors["edges"].append(actor)
-
-    if bend_pts:
-        mesh = pv.PolyData(np.array(bend_pts, dtype=float))
-        mesh.lines = np.array(bend_lines, dtype=int)
-        actor = plotter.add_mesh(
-            mesh, color="#E87722", line_width=3.0, pickable=False, name="bend_edges"
-        )
-        actors["bend_edges"].append(actor)
+    _hover_actor = vtk.vtkTextActor()
+    _hover_actor.SetInput("")
+    _hover_actor.GetTextProperty().SetFontSize(13)
+    _hover_actor.GetTextProperty().SetColor(0.05, 0.05, 0.05)
+    _hover_actor.GetTextProperty().SetBackgroundColor(1.0, 1.0, 0.85)
+    _hover_actor.GetTextProperty().SetBackgroundOpacity(0.85)
+    _hover_actor.GetTextProperty().SetShadow(True)
+    _hover_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+    _hover_actor.SetPosition(0.62, 0.02)
+    plotter.renderer.AddActor2D(_hover_actor)
+    _hover_last: list[str] = [""]
 
     # ------------------------------------------------------------------ #
-    #  Vertices                                                            #
+    #  Graph build / rebuild (called once at start and on navigation)    #
     # ------------------------------------------------------------------ #
-    cluster_map = classify_vertices(graph.vertices)
-    vid_list = sorted(graph.vertices.keys())
-    coords = np.array([graph.vertices[v] for v in vid_list], dtype=float)
+    def _build_graph(g: SheetMetalGraph, path: str) -> None:
+        # Remove named mesh actors
+        for _name in ("faces", "edges", "bend_edges", "vertices"):
+            try:
+                plotter.remove_actor(_name)
+            except Exception:
+                pass
+        # Remove point-label actors (no name= in add_point_labels)
+        for _a in _lbl_actors:
+            try:
+                plotter.remove_actor(_a)
+            except Exception:
+                pass
+        _lbl_actors.clear()
+        for _key in actors:
+            actors[_key].clear()   # in-place clear so checkbox closures still work
 
-    pt_cloud = pv.PolyData(coords)
-    pt_cloud.point_data["cluster"] = np.array(
-        [cluster_map[v] for v in vid_list], dtype=float
-    )
-    pt_cloud.point_data["vertex_id"] = np.array(vid_list, dtype=int)
+        _cur_graph[0] = g
+        _set_title(g, path)
+        _hover_last[0] = ""
+        _hover_actor.SetInput("")
 
-    actor = plotter.add_mesh(
-        pt_cloud,
-        scalars="cluster",
-        cmap="tab10",
-        clim=[0, 9],
-        point_size=8,
-        render_points_as_spheres=True,
-        show_scalar_bar=False,
-        pickable=True,
-        name="vertices",
-    )
-    actors["vertices"].append(actor)
+        bend_eids = g.bend_edge_ids
+        bad_faces: list[int] = []
+
+        # -- Faces --
+        face_pts:   list = []
+        face_cells: list[int] = []
+        fid_per_pt: list[int] = []
+        fid_per_cell: list[int] = []
+        pt_off = 0
+        for face_id in g.lamina_face_edges:
+            poly, ok = _extract_face_polygon(g, face_id)
+            if ok and len(poly) >= 3:
+                n = len(poly)
+                face_pts.extend(poly)
+                fid_per_pt.extend([face_id] * n)
+                face_cells.extend([n] + list(range(pt_off, pt_off + n)))
+                fid_per_cell.append(face_id)
+                pt_off += n
+            elif not ok:
+                bad_faces.append(face_id)
+
+        if face_pts:
+            fm = pv.PolyData(np.array(face_pts, dtype=float),
+                             np.array(face_cells, dtype=int))
+            fm.point_data["face_id"]  = np.array(fid_per_pt,  dtype=int)
+            fm.cell_data["color_key"] = np.array([i % 8 for i in fid_per_cell], dtype=float)
+            actors["faces"].append(plotter.add_mesh(
+                fm, scalars="color_key", cmap="Pastel1", show_scalar_bar=False,
+                opacity=0.75, show_edges=False, lighting=True,
+                pickable=True, name="faces", clim=[0, 7],
+            ))
+
+        # -- Edges --
+        reg_pts: list = [];  reg_lines: list[int] = []
+        bnd_pts: list = [];  bnd_lines: list[int] = []
+        for eid, (v1, v2) in g.edges.items():
+            if v1 not in g.vertices or v2 not in g.vertices:
+                continue
+            p1 = list(g.vertices[v1]);  p2 = list(g.vertices[v2])
+            if eid in bend_eids:
+                i = len(bnd_pts);  bnd_pts.extend([p1, p2]);  bnd_lines.extend([2, i, i + 1])
+            else:
+                i = len(reg_pts);  reg_pts.extend([p1, p2]);  reg_lines.extend([2, i, i + 1])
+
+        if reg_pts:
+            m = pv.PolyData(np.array(reg_pts, dtype=float))
+            m.lines = np.array(reg_lines, dtype=int)
+            actors["edges"].append(
+                plotter.add_mesh(m, color="#555555", line_width=1.5,
+                                 pickable=False, name="edges"))
+        if bnd_pts:
+            m = pv.PolyData(np.array(bnd_pts, dtype=float))
+            m.lines = np.array(bnd_lines, dtype=int)
+            actors["bend_edges"].append(
+                plotter.add_mesh(m, color="#E87722", line_width=3.0,
+                                 pickable=False, name="bend_edges"))
+
+        # -- Vertices --
+        cluster_map = classify_vertices(g.vertices)
+        vid_list    = sorted(g.vertices.keys())
+        coords      = np.array([g.vertices[v] for v in vid_list], dtype=float)
+        pt_cloud    = pv.PolyData(coords)
+        pt_cloud.point_data["cluster"]   = np.array([cluster_map[v] for v in vid_list], dtype=float)
+        pt_cloud.point_data["vertex_id"] = np.array(vid_list, dtype=int)
+        actors["vertices"].append(plotter.add_mesh(
+            pt_cloud, scalars="cluster", cmap="tab10", clim=[0, 9],
+            point_size=8, render_points_as_spheres=True,
+            show_scalar_bar=False, pickable=True, name="vertices",
+        ))
+
+        # -- Vertex labels (optional) --
+        if show_labels and vid_list:
+            a = plotter.add_point_labels(
+                pt_cloud, [str(v) for v in vid_list],
+                font_size=8, text_color="black",
+                show_points=False, always_visible=False, name="labels",
+            )
+            actors["labels"].append(a);  _lbl_actors.append(a)
+
+        # -- Bend annotations --
+        ann_pts:   list = [];  ann_txts: list[str] = []
+        for bid, angle_rad in g.bend_angles.items():
+            c = g.bend_centroid(bid)
+            if c:
+                ann_pts.append(list(c))
+                ann_txts.append(f"B{bid}  {math.degrees(angle_rad):.0f}°")
+        if ann_pts:
+            ac = pv.PolyData(np.array(ann_pts, dtype=float))
+            a  = plotter.add_point_labels(
+                ac, ann_txts, font_size=10, text_color="#C05000", bold=True,
+                show_points=False, always_visible=True, name="bend_annots",
+            )
+            actors["bend_annots"].append(a);  _lbl_actors.append(a)
+
+        if bad_faces:
+            print(f"WARNING: {len(bad_faces)} malformed face(s) skipped: {bad_faces}")
+
+        plotter.reset_camera()
+
+    # ---- Initial build ----
+    _build_graph(graph, title)
 
     # ------------------------------------------------------------------ #
-    #  Vertex labels (optional)                                            #
-    # ------------------------------------------------------------------ #
-    if show_labels and len(vid_list) > 0:
-        actor = plotter.add_point_labels(
-            pt_cloud,
-            [str(v) for v in vid_list],
-            font_size=8,
-            text_color="black",
-            show_points=False,
-            always_visible=False,
-            name="labels",
-        )
-        actors["labels"].append(actor)
-
-    # ------------------------------------------------------------------ #
-    #  Bend annotations                                                    #
-    # ------------------------------------------------------------------ #
-    annot_pts: list = []
-    annot_texts: list[str] = []
-    for bid, angle_rad in graph.bend_angles.items():
-        c = graph.bend_centroid(bid)
-        if c:
-            annot_pts.append(list(c))
-            annot_texts.append(f"B{bid}  {math.degrees(angle_rad):.0f}°")
-
-    if annot_pts:
-        annot_cloud = pv.PolyData(np.array(annot_pts, dtype=float))
-        actor = plotter.add_point_labels(
-            annot_cloud,
-            annot_texts,
-            font_size=10,
-            text_color="#C05000",
-            bold=True,
-            show_points=False,
-            always_visible=True,
-            name="bend_annots",
-        )
-        actors["bend_annots"].append(actor)
-
-    # ------------------------------------------------------------------ #
-    #  Layer toggle checkboxes (top-left, pixel coords from bottom-left)  #
+    #  Layer toggle checkboxes                                            #
     # ------------------------------------------------------------------ #
     TOGGLES = [
         ("faces",       "Faces",       True,        "#D4E8F0"),
@@ -456,9 +649,8 @@ def visualize(
         ("labels",      "Labels",      show_labels, "#333333"),
         ("bend_annots", "Bend Annots", True,        "#C05000"),
     ]
-
     CB_SIZE, CB_GAP = 25, 5
-    _start_y = _WIN_H - 100  # leave room for title bar; 6 checkboxes × 30px = 180px used
+    _start_y = _WIN_H - 100
 
     def _make_toggle(key: str):
         def _cb(state: bool):
@@ -473,88 +665,57 @@ def visualize(
             plotter.render()
         return _cb
 
-    for idx, (layer_key, layer_label, initial, color) in enumerate(TOGGLES):
-        y_px = _start_y - idx * (CB_SIZE + CB_GAP)
+    for _idx, (layer_key, layer_label, initial, color) in enumerate(TOGGLES):
+        y_px = _start_y - _idx * (CB_SIZE + CB_GAP)
         plotter.add_checkbox_button_widget(
-            _make_toggle(layer_key),
-            value=initial,
-            position=(10, y_px),
-            size=CB_SIZE,
-            border_size=2,
-            color_on=color,
-            color_off="#CCCCCC",
+            _make_toggle(layer_key), value=initial,
+            position=(10, y_px), size=CB_SIZE, border_size=2,
+            color_on=color, color_off="#CCCCCC",
         )
-        plotter.add_text(
-            layer_label,
-            position=(45, y_px + 4),   # pixel coords, same system as checkbox
-            font_size=9,
-            color="black",
-        )
+        plotter.add_text(layer_label, position=(45, y_px + 4),
+                         font_size=9, color="black")
 
     # ------------------------------------------------------------------ #
-    #  Hover inspection (mouse-move VTK observer)                         #
+    #  Hover inspection                                                   #
     # ------------------------------------------------------------------ #
-    # Use a raw vtkTextActor so SetInput is guaranteed to work regardless
-    # of which PyVista Actor wrapper add_text returns.
-    _hover_text_actor = vtk.vtkTextActor()
-    _hover_text_actor.SetInput("")
-    _hover_text_actor.GetTextProperty().SetFontSize(13)
-    _hover_text_actor.GetTextProperty().SetColor(0.05, 0.05, 0.05)
-    _hover_text_actor.GetTextProperty().SetBackgroundColor(1.0, 1.0, 0.85)
-    _hover_text_actor.GetTextProperty().SetBackgroundOpacity(0.85)
-    _hover_text_actor.GetTextProperty().SetShadow(True)
-    # Position: normalized viewport coords (0-1), lower-right
-    _hover_text_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
-    _hover_text_actor.SetPosition(0.62, 0.02)
-    plotter.renderer.AddActor2D(_hover_text_actor)
-
-    # Picker created once — avoids per-frame allocation / GC churn
-    _hover_picker = vtk.vtkPointPicker()
+    _hover_picker    = vtk.vtkPointPicker()
     _hover_picker.SetTolerance(0.01)
-    _hover_renderer = plotter.renderer
-    _hover_last: list[str] = [""]   # cache: only call SetInput when text changes
-    _hover_next_t: list[float] = [0.0]  # 60 fps gate: earliest time for next pick
-    _HOVER_INTERVAL = 1.0 / 60.0        # ~16.67 ms
+    _hover_renderer  = plotter.renderer
+    _hover_next_t:   list[float] = [0.0]
+    _HOVER_INTERVAL  = 1.0 / 60.0
 
     def _on_mouse_move(obj, event):
         import time
         now = time.perf_counter()
         if now < _hover_next_t[0]:
-            return                       # drop frame — within the 60 fps window
+            return
         _hover_next_t[0] = now + _HOVER_INTERVAL
-
         try:
             x, y = plotter.iren.get_event_position()
         except AttributeError:
             x, y = plotter.iren.GetEventPosition()
-
         _hover_picker.Pick(x, y, 0, _hover_renderer)
         pid  = _hover_picker.GetPointId()
         dset = _hover_picker.GetDataSet()
-
         new_text = ""
         if dset is not None and pid >= 0:
             pd      = dset.GetPointData()
             vid_arr = pd.GetArray("vertex_id")
             fid_arr = pd.GetArray("face_id")
-
+            g = _cur_graph[0]
             if vid_arr is not None and pid < vid_arr.GetNumberOfTuples():
                 vid = int(vid_arr.GetValue(pid))
-                x_, y_, z_ = graph.vertices.get(vid, (0.0, 0.0, 0.0))
-                new_text = (f"Vertex {vid}\n"
-                            f"  x = {x_:.3f} mm\n"
-                            f"  y = {y_:.3f} mm\n"
-                            f"  z = {z_:.3f} mm")
+                x_, y_, z_ = g.vertices.get(vid, (0.0, 0.0, 0.0))
+                new_text = (f"Vertex {vid}\n  x = {x_:.3f} mm\n"
+                            f"  y = {y_:.3f} mm\n  z = {z_:.3f} mm")
             elif fid_arr is not None and pid < fid_arr.GetNumberOfTuples():
                 fid    = int(fid_arr.GetValue(pid))
-                nedges = len(graph.lamina_face_edges.get(fid, []))
+                nedges = len(g.lamina_face_edges.get(fid, []))
                 new_text = f"Lamina Face {fid}\n  {nedges} boundary edges"
-
-        if new_text != _hover_last[0]:   # only update actor when text changes
+        if new_text != _hover_last[0]:
             _hover_last[0] = new_text
-            _hover_text_actor.SetInput(new_text)
+            _hover_actor.SetInput(new_text)
 
-    # Register observer on the VTK interactor
     try:
         plotter.iren.AddObserver("MouseMoveEvent", _on_mouse_move)
     except AttributeError:
@@ -564,7 +725,7 @@ def visualize(
             _raw.AddObserver("MouseMoveEvent", _on_mouse_move)
 
     # ------------------------------------------------------------------ #
-    #  Drag-and-drop: drop a new file onto the window to reload           #
+    #  Drag-and-drop (Win32 WndProc; handles both files and folders)     #
     # ------------------------------------------------------------------ #
     def _get_iren():
         iren = plotter.iren
@@ -575,24 +736,61 @@ def visualize(
     def _on_render_start(obj, event):
         if _dnd_ready[0]:
             return
-        def _on_dropped(path):
-            _next_file[0] = path
+
+        def _on_dropped(raw_path: str) -> None:
+            if os.path.isdir(raw_path):
+                files = _scan_folder(raw_path)
+                if not files:
+                    print(f"No .graph files found in: {raw_path}")
+                    return
+                _next_file[0]     = files[0]
+                _next_playlist[0] = files
+            else:
+                _next_file[0]     = raw_path
+                _next_playlist[0] = None
             _get_iren().TerminateApp()
+
         if _setup_win32_dnd(plotter.render_window, _on_dropped):
             _dnd_ready[0] = True
 
     plotter.render_window.AddObserver("StartEvent", _on_render_start)
 
     # ------------------------------------------------------------------ #
-    #  View preset keyboard shortcuts                                      #
+    #  File list panel + Up/Down navigation (playlist mode only)         #
+    # ------------------------------------------------------------------ #
+    if playlist and len(playlist) > 1:
+        _pl_idx = [playlist_idx]
+        _panel  = _FileListPanel(plotter.renderer, vtk, playlist,
+                                 playlist_idx, _WIN_W, _WIN_H)
+
+        def _navigate(delta: int) -> None:
+            new_idx = _pl_idx[0] + delta
+            if not (0 <= new_idx < len(playlist)):
+                return
+            new_path = playlist[new_idx]
+            try:
+                new_graph = _load_graph(new_path)
+            except SystemExit as exc:
+                print(exc)
+                return
+            _pl_idx[0] = new_idx
+            _panel.select(new_idx)
+            _build_graph(new_graph, new_path)
+            plotter.render()
+
+        plotter.add_key_event("Up",   lambda: _navigate(-1))
+        plotter.add_key_event("Down", lambda: _navigate( 1))
+
+    # ------------------------------------------------------------------ #
+    #  View preset keyboard shortcuts                                     #
     # ------------------------------------------------------------------ #
     _VIEW_KEYS: dict[str, tuple] = {
-        "1": ((0.0,  0.0,  1.0), (0.0, 1.0, 0.0)),  # Top
-        "2": ((0.0, -1.0,  0.0), (0.0, 0.0, 1.0)),  # Front
-        "3": ((1.0,  0.0,  0.0), (0.0, 0.0, 1.0)),  # Side
-        "4": ((1.0, -1.0,  1.0), (0.0, 0.0, 1.0)),  # Iso
-        "5": ((0.0,  1.0,  0.0), (0.0, 0.0, 1.0)),  # Back
-        "0": ((1.0, -1.0,  1.0), (0.0, 0.0, 1.0)),  # Home
+        "1": ((0.0,  0.0,  1.0), (0.0, 1.0, 0.0)),   # Top
+        "2": ((0.0, -1.0,  0.0), (0.0, 0.0, 1.0)),   # Front
+        "3": ((1.0,  0.0,  0.0), (0.0, 0.0, 1.0)),   # Side
+        "4": ((1.0, -1.0,  1.0), (0.0, 0.0, 1.0)),   # Iso
+        "5": ((0.0,  1.0,  0.0), (0.0, 0.0, 1.0)),   # Back
+        "0": ((1.0, -1.0,  1.0), (0.0, 0.0, 1.0)),   # Home
     }
 
     def _make_view_cb(pos_dir: tuple, up: tuple):
@@ -601,8 +799,8 @@ def visualize(
             plotter.reset_camera()
         return _cb
 
-    for key, (pos_dir, up) in _VIEW_KEYS.items():
-        plotter.add_key_event(key, _make_view_cb(pos_dir, up))
+    for _key, (_pos_dir, _up) in _VIEW_KEYS.items():
+        plotter.add_key_event(_key, _make_view_cb(_pos_dir, _up))
 
     def _reset_view():
         plotter.view_vector((1.0, -1.0, 1.0), viewup=(0.0, 0.0, 1.0))
@@ -611,21 +809,31 @@ def visualize(
     plotter.add_key_event("r", _reset_view)
 
     def _on_open_file():
-        path = _open_file_dialog()
-        if path:
-            _next_file[0] = path
-            _get_iren().TerminateApp()
+        path, is_folder = _open_file_or_folder_dialog()
+        if not path:
+            return
+        if is_folder:
+            files = _scan_folder(path)
+            if not files:
+                print(f"No .graph files found in: {path}")
+                return
+            _next_file[0]     = files[0]
+            _next_playlist[0] = files
+        else:
+            _next_file[0]     = path
+            _next_playlist[0] = None
+        _get_iren().TerminateApp()
 
     plotter.add_key_event("o", _on_open_file)
     plotter.add_key_event("O", _on_open_file)
 
     # ------------------------------------------------------------------ #
-    #  Screenshot (S key → PNG timestamped in working directory)          #
+    #  Screenshot                                                         #
     # ------------------------------------------------------------------ #
     import datetime
 
     def _save_screenshot():
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"sheet_metal_{ts}.png"
         plotter.screenshot(fname, transparent_background=False)
         print(f"Screenshot saved: {fname}")
@@ -633,44 +841,30 @@ def visualize(
     plotter.add_key_event("s", _save_screenshot)
 
     # ------------------------------------------------------------------ #
-    #  Axes indicator, title, stats                                        #
+    #  Axes + console summary                                             #
     # ------------------------------------------------------------------ #
     plotter.add_axes(line_width=2)
 
-    nv  = len(graph.vertices)
-    ne  = len(graph.edges)
-    nb  = len(graph.bend_angles)
-    nf  = len(graph.coarse_face_lfaces)
-    nlf = len(graph.lamina_face_edges)
-    plotter.add_text(
-        f"{os.path.basename(title)}  |  {nv}V  {ne}E  {nb} bends  "
-        f"{nf} faces ({nlf} laminas)",
-        position="upper_edge",
-        font_size=10,
-        color="black",
-    )
-
-    if bad_faces:
-        print(f"WARNING: {len(bad_faces)} malformed face(s) skipped: {bad_faces}")
-
     print("\n--- Controls ---")
     print("  Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot")
-    print("         O=Open file")
+    print("         O=Open file/folder")
+    if playlist and len(playlist) > 1:
+        print(f"         Up/Down = navigate playlist ({len(playlist)} files)")
     print("  Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom")
     print("  Hover over geometry to inspect elements (vertex coords, face info)")
     print("  Top-left checkboxes: toggle layer visibility")
-    print("  Drag a graph file onto the window to reload")
+    print("  Drag a file or folder onto the window to reload / open playlist")
 
     plotter.show(auto_close=False)
     try:
         plotter.close()
     except Exception:
         pass
-    return _next_file[0]
+    return _next_file[0], _next_playlist[0]
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point helpers
 # ---------------------------------------------------------------------------
 
 _REQUIRED_GRAPH_KEYS = [
@@ -703,30 +897,75 @@ def _load_graph(path: str) -> SheetMetalGraph:
     return SheetMetalGraph.from_dict(graph_dict)
 
 
-def _open_file_dialog() -> Optional[str]:
-    """Open a native OS file picker; return selected path or None."""
+def _open_file_or_folder_dialog() -> tuple[Optional[str], bool]:
+    """Show a dialog to pick a file or a folder.  Returns (path, is_folder)."""
     try:
         import tkinter as tk
         from tkinter import filedialog
+
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        path = filedialog.askopenfilename(
-            title="Open Graph File",
-            filetypes=[
-                ("Graph files", "*.txt *.json"),
-                ("All files", "*.*"),
-            ],
-        )
+
+        chosen: list[Optional[str]] = [None]
+        is_dir: list[bool]          = [False]
+
+        dlg = tk.Toplevel(root)
+        dlg.title("Open")
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+
+        tk.Label(
+            dlg,
+            text="Open a graph file or a folder containing .graph files:",
+            wraplength=290, pady=10, padx=10,
+        ).pack()
+
+        frame = tk.Frame(dlg, pady=8)
+        frame.pack()
+
+        def _pick_file():
+            p = filedialog.askopenfilename(
+                parent=dlg, title="Open Graph File",
+                filetypes=[("Graph files", "*.graph *.txt *.json"),
+                           ("All files", "*.*")],
+            )
+            if p:
+                chosen[0] = p.strip()
+                is_dir[0] = False
+            dlg.destroy()
+
+        def _pick_folder():
+            p = filedialog.askdirectory(
+                parent=dlg, title="Select Folder with .graph Files",
+            )
+            if p:
+                chosen[0] = p.strip()
+                is_dir[0] = True
+            dlg.destroy()
+
+        tk.Button(frame, text="Open File",   command=_pick_file,   width=14).pack(side=tk.LEFT,  padx=6)
+        tk.Button(frame, text="Open Folder", command=_pick_folder, width=14).pack(side=tk.LEFT,  padx=6)
+        tk.Button(frame, text="Cancel",      command=dlg.destroy,  width=10).pack(side=tk.LEFT,  padx=6)
+
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.update_idletasks()
+        w  = dlg.winfo_reqwidth()
+        h  = dlg.winfo_reqheight()
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        root.wait_window(dlg)
         root.destroy()
-        return path.strip() or None
+        return chosen[0] or None, is_dir[0]
     except Exception:
-        return None
+        return None, False
 
 
-def _welcome_screen() -> Optional[str]:
+def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
     """Splash window shown when no file is provided at startup.
-    Returns the file path the user selected/dropped, or None if they quit."""
+    Returns (first_path, playlist) — playlist is None for single files."""
     pv.global_theme.background = "#1C1C2E"
     pl = pv.Plotter(
         title="Sheet Metal Graph Visualizer",
@@ -734,22 +973,17 @@ def _welcome_screen() -> Optional[str]:
     )
     pl.enable_trackball_style()
 
+    pl.add_text("Sheet Metal Graph Visualizer",
+                position="upper_edge", font_size=16, color="white")
     pl.add_text(
-        "Sheet Metal Graph Visualizer",
-        position="upper_edge",
-        font_size=16,
-        color="white",
-    )
-    pl.add_text(
-        "Drop a graph file (.txt / .json) onto this window\n\n"
-        "Press  O  to browse for a file\n\n"
+        "Drop a .graph file or folder onto this window\n\n"
+        "Press  O  to browse for a file or folder\n\n"
         "Press  Q  to quit",
-        position="lower_edge",
-        font_size=12,
-        color="#AAAAAA",
+        position="lower_edge", font_size=12, color="#AAAAAA",
     )
 
-    result: list[Optional[str]] = [None]
+    result_path:     list[Optional[str]]        = [None]
+    result_playlist: list[Optional[list[str]]]  = [None]
 
     def _get_iren():
         iren = pl.iren
@@ -760,19 +994,38 @@ def _welcome_screen() -> Optional[str]:
     def _on_render_start(obj, event):
         if _dnd_ready[0]:
             return
-        def _on_dropped(path):
-            result[0] = path
+
+        def _on_dropped(raw_path: str) -> None:
+            if os.path.isdir(raw_path):
+                files = _scan_folder(raw_path)
+                if not files:
+                    print(f"No .graph files found in: {raw_path}")
+                    return
+                result_path[0]     = files[0]
+                result_playlist[0] = files
+            else:
+                result_path[0] = raw_path
             _get_iren().TerminateApp()
+
         if _setup_win32_dnd(pl.render_window, _on_dropped):
             _dnd_ready[0] = True
 
     pl.render_window.AddObserver("StartEvent", _on_render_start)
 
     def _on_open():
-        path = _open_file_dialog()
-        if path:
-            result[0] = path
-            _get_iren().TerminateApp()
+        path, is_folder = _open_file_or_folder_dialog()
+        if not path:
+            return
+        if is_folder:
+            files = _scan_folder(path)
+            if not files:
+                print(f"No .graph files found in: {path}")
+                return
+            result_path[0]     = files[0]
+            result_playlist[0] = files
+        else:
+            result_path[0] = path
+        _get_iren().TerminateApp()
 
     pl.add_key_event("o", _on_open)
     pl.add_key_event("O", _on_open)
@@ -784,25 +1037,45 @@ def _welcome_screen() -> Optional[str]:
         pass
 
     pv.global_theme.background = "white"
-    return result[0]
+    return result_path[0], result_playlist[0]
 
 
 def main() -> None:
     import sys
 
     show_labels = "--labels" in sys.argv
-    cli_files = [a for a in sys.argv[1:] if not a.startswith("-")]
+    cli_args    = [a for a in sys.argv[1:] if not a.startswith("-")]
 
-    path: Optional[str] = cli_files[0] if cli_files else _welcome_screen()
+    if cli_args:
+        raw = cli_args[0]
+        if os.path.isdir(raw):
+            playlist: Optional[list[str]] = _scan_folder(raw)
+            path: Optional[str]           = playlist[0] if playlist else None
+        else:
+            playlist = None
+            path     = raw
+    else:
+        path, playlist = _welcome_screen()
 
     while path:
         try:
             graph = _load_graph(path)
         except SystemExit as exc:
             print(exc)
-            path = _welcome_screen()
+            path, playlist = _welcome_screen()
             continue
-        path = visualize(graph, title=path, show_labels=show_labels)
+
+        pl_idx = 0
+        if playlist:
+            try:
+                pl_idx = playlist.index(path)
+            except ValueError:
+                pass
+
+        path, playlist = visualize(
+            graph, title=path, show_labels=show_labels,
+            playlist=playlist, playlist_idx=pl_idx,
+        )
 
 
 if __name__ == "__main__":
