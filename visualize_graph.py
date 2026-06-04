@@ -61,7 +61,15 @@ def _setup_win32_dnd(render_window, on_file_callback) -> bool:
         shell32 = ctypes.windll.shell32
         user32  = ctypes.windll.user32
 
-        hwnd = render_window.GetGenericWindowId()
+        # VTK returns the HWND as an opaque string '_HEXADDR_p_void', not an int
+        hwnd_raw = render_window.GetGenericWindowId()
+        if hwnd_raw is None:
+            return False
+        if isinstance(hwnd_raw, str):
+            parts = hwnd_raw.split("_")
+            hwnd = int(parts[1], 16) if len(parts) >= 2 and parts[1] else 0
+        else:
+            hwnd = int(hwnd_raw)
         if not hwnd:
             return False
 
@@ -567,11 +575,11 @@ def visualize(
     def _on_render_start(obj, event):
         if _dnd_ready[0]:
             return
-        _dnd_ready[0] = True
         def _on_dropped(path):
             _next_file[0] = path
             _get_iren().TerminateApp()
-        _setup_win32_dnd(plotter.render_window, _on_dropped)
+        if _setup_win32_dnd(plotter.render_window, _on_dropped):
+            _dnd_ready[0] = True
 
     plotter.render_window.AddObserver("StartEvent", _on_render_start)
 
@@ -752,11 +760,11 @@ def _welcome_screen() -> Optional[str]:
     def _on_render_start(obj, event):
         if _dnd_ready[0]:
             return
-        _dnd_ready[0] = True
         def _on_dropped(path):
             result[0] = path
             _get_iren().TerminateApp()
-        _setup_win32_dnd(pl.render_window, _on_dropped)
+        if _setup_win32_dnd(pl.render_window, _on_dropped):
+            _dnd_ready[0] = True
 
     pl.render_window.AddObserver("StartEvent", _on_render_start)
 
