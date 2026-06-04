@@ -14,8 +14,8 @@ Usage:
 
 Controls:
     Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot
-           O = open file dialog   F = open folder dialog
-           Up / Down = navigate playlist (when a folder is open)
+           O=Open file  F=Open folder  +/-=Zoom
+           Up/Down = navigate playlist (when a folder is open)
     Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom
     Top-left checkboxes: toggle layer visibility
     Hover over geometry to inspect elements
@@ -504,6 +504,18 @@ def visualize(
                          window_size=[_WIN_W, _WIN_H])
     plotter.enable_trackball_style()
 
+    # Remap zoom from Up/Down (needed for playlist nav) to +/- keys
+    def _zoom_in():
+        plotter.camera.zoom(1.1)
+        plotter.render()
+    def _zoom_out():
+        plotter.camera.zoom(0.9)
+        plotter.render()
+    plotter.add_key_event("plus", _zoom_in)
+    plotter.add_key_event("equal", _zoom_in)   # +/= are same key
+    plotter.add_key_event("minus", _zoom_out)
+    plotter.add_key_event("underscore", _zoom_out)
+
     # Actors dict — checkbox callbacks close over the *lists* so we always
     # clear() in-place on rebuild (never reassign the list references).
     actors: dict[str, list] = {
@@ -891,7 +903,7 @@ def visualize(
 
     print("\n--- Controls ---")
     print("  Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot")
-    print("         O=Open file  F=Open folder")
+    print("         O=Open file  F=Open folder  +/-=Zoom")
     if playlist and len(playlist) > 1:
         print(f"         Up/Down = navigate playlist ({len(playlist)} files)")
     print("  Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom")
