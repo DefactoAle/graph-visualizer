@@ -14,7 +14,7 @@ Usage:
 
 Controls:
     Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot
-           O = open file / folder dialog
+           O = open file dialog   F = open folder dialog
            Up / Down = navigate playlist (when a folder is open)
     Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom
     Top-left checkboxes: toggle layer visibility
@@ -808,24 +808,29 @@ def visualize(
 
     plotter.add_key_event("r", _reset_view)
 
-    def _on_open_file():
-        path, is_folder = _open_file_or_folder_dialog()
-        if not path:
-            return
-        if is_folder:
-            files = _scan_folder(path)
-            if not files:
-                print(f"No .graph files found in: {path}")
-                return
-            _next_file[0]     = files[0]
-            _next_playlist[0] = files
-        else:
+    def _open_file():
+        path = _pick_file_dialog()
+        if path:
             _next_file[0]     = path
             _next_playlist[0] = None
+            _get_iren().TerminateApp()
+
+    def _open_folder():
+        folder = _pick_folder_dialog()
+        if not folder:
+            return
+        files = _scan_folder(folder)
+        if not files:
+            print(f"No .graph files found in: {folder}")
+            return
+        _next_file[0]     = files[0]
+        _next_playlist[0] = files
         _get_iren().TerminateApp()
 
-    plotter.add_key_event("o", _on_open_file)
-    plotter.add_key_event("O", _on_open_file)
+    plotter.add_key_event("o", _open_file)
+    plotter.add_key_event("O", _open_file)
+    plotter.add_key_event("f", _open_folder)
+    plotter.add_key_event("F", _open_folder)
 
     # ------------------------------------------------------------------ #
     #  Screenshot                                                         #
@@ -847,7 +852,7 @@ def visualize(
 
     print("\n--- Controls ---")
     print("  Keys : 1=Top  2=Front  3=Side  4=Iso  5=Back  0=Home  R=Reset  S=Screenshot")
-    print("         O=Open file/folder")
+    print("         O=Open file  F=Open folder")
     if playlist and len(playlist) > 1:
         print(f"         Up/Down = navigate playlist ({len(playlist)} files)")
     print("  Mouse: Left-drag=Orbit  Middle-drag=Pan  Scroll=Zoom")
@@ -897,70 +902,40 @@ def _load_graph(path: str) -> SheetMetalGraph:
     return SheetMetalGraph.from_dict(graph_dict)
 
 
-def _open_file_or_folder_dialog() -> tuple[Optional[str], bool]:
-    """Show a dialog to pick a file or a folder.  Returns (path, is_folder)."""
+def _pick_file_dialog() -> Optional[str]:
+    """Native OS file-open dialog.  Returns selected path or None."""
     try:
         import tkinter as tk
         from tkinter import filedialog
-
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-
-        chosen: list[Optional[str]] = [None]
-        is_dir: list[bool]          = [False]
-
-        dlg = tk.Toplevel(root)
-        dlg.title("Open")
-        dlg.resizable(False, False)
-        dlg.attributes("-topmost", True)
-
-        tk.Label(
-            dlg,
-            text="Open a graph file or a folder containing .graph files:",
-            wraplength=290, pady=10, padx=10,
-        ).pack()
-
-        frame = tk.Frame(dlg, pady=8)
-        frame.pack()
-
-        def _pick_file():
-            p = filedialog.askopenfilename(
-                parent=dlg, title="Open Graph File",
-                filetypes=[("Graph files", "*.graph *.txt *.json"),
-                           ("All files", "*.*")],
-            )
-            if p:
-                chosen[0] = p.strip()
-                is_dir[0] = False
-            dlg.destroy()
-
-        def _pick_folder():
-            p = filedialog.askdirectory(
-                parent=dlg, title="Select Folder with .graph Files",
-            )
-            if p:
-                chosen[0] = p.strip()
-                is_dir[0] = True
-            dlg.destroy()
-
-        tk.Button(frame, text="Open File",   command=_pick_file,   width=14).pack(side=tk.LEFT,  padx=6)
-        tk.Button(frame, text="Open Folder", command=_pick_folder, width=14).pack(side=tk.LEFT,  padx=6)
-        tk.Button(frame, text="Cancel",      command=dlg.destroy,  width=10).pack(side=tk.LEFT,  padx=6)
-
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        dlg.update_idletasks()
-        w  = dlg.winfo_reqwidth()
-        h  = dlg.winfo_reqheight()
-        sw = dlg.winfo_screenwidth()
-        sh = dlg.winfo_screenheight()
-        dlg.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
-
-        root.wait_window(dlg)
+        root.lift()
+        p = filedialog.askopenfilename(
+            title="Open Graph File",
+            filetypes=[("Graph files", "*.graph *.txt *.json"),
+                       ("All files", "*.*")],
+        )
         root.destroy()
-        return chosen[0] or None, is_dir[0]
+        return p.strip() or None
     except Exception:
-        return None, False
+        return None
+
+
+def _pick_folder_dialog() -> Optional[str]:
+    """Native OS folder-browse dialog.  Returns selected folder or None."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.lift()
+        p = filedialog.askdirectory(title="Select Folder with .graph Files")
+        root.destroy()
+        return p.strip() or None
+    except Exception:
+        return None
 
 
 def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
@@ -977,7 +952,7 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
                 position="upper_edge", font_size=16, color="white")
     pl.add_text(
         "Drop a .graph file or folder onto this window\n\n"
-        "Press  O  to browse for a file or folder\n\n"
+        "Press  O  to open a file   |   F  to open a folder\n\n"
         "Press  Q  to quit",
         position="lower_edge", font_size=12, color="#AAAAAA",
     )
@@ -1012,23 +987,28 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
 
     pl.render_window.AddObserver("StartEvent", _on_render_start)
 
-    def _on_open():
-        path, is_folder = _open_file_or_folder_dialog()
-        if not path:
-            return
-        if is_folder:
-            files = _scan_folder(path)
-            if not files:
-                print(f"No .graph files found in: {path}")
-                return
-            result_path[0]     = files[0]
-            result_playlist[0] = files
-        else:
+    def _open_file():
+        path = _pick_file_dialog()
+        if path:
             result_path[0] = path
+            _get_iren().TerminateApp()
+
+    def _open_folder():
+        folder = _pick_folder_dialog()
+        if not folder:
+            return
+        files = _scan_folder(folder)
+        if not files:
+            print(f"No .graph files found in: {folder}")
+            return
+        result_path[0]     = files[0]
+        result_playlist[0] = files
         _get_iren().TerminateApp()
 
-    pl.add_key_event("o", _on_open)
-    pl.add_key_event("O", _on_open)
+    pl.add_key_event("o", _open_file)
+    pl.add_key_event("O", _open_file)
+    pl.add_key_event("f", _open_folder)
+    pl.add_key_event("F", _open_folder)
 
     pl.show(auto_close=False)
     try:
