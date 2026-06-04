@@ -41,6 +41,20 @@ except ImportError as exc:
 
 
 # ---------------------------------------------------------------------------
+# Debug logger — writes to debug.log (visible even in .pyw / no-console mode)
+# ---------------------------------------------------------------------------
+
+def _dbg(msg: str) -> None:
+    import datetime
+    _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log")
+    try:
+        with open(_path, "a", encoding="utf-8") as _f:
+            _f.write(f"[{datetime.datetime.now():%H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Win32 drag-and-drop helper (no extra dependencies – pure ctypes)
 # ---------------------------------------------------------------------------
 
@@ -946,6 +960,7 @@ def _pick_file_dialog() -> Optional[str]:
 
 def _pick_folder_dialog() -> Optional[str]:
     """Native OS folder-browse dialog.  Returns selected folder or None."""
+    _dbg("_pick_folder_dialog: opening dialog")
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -955,8 +970,11 @@ def _pick_folder_dialog() -> Optional[str]:
         root.lift()
         p = filedialog.askdirectory(title="Select Folder with .graph Files")
         root.destroy()
-        return p.strip() or None
-    except Exception:
+        result = p.strip() or None
+        _dbg(f"_pick_folder_dialog: returning {result!r}")
+        return result
+    except Exception as _e:
+        _dbg(f"_pick_folder_dialog: EXCEPTION {_e}")
         return None
 
 
@@ -1013,18 +1031,22 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
             return
 
         def _on_dropped(raw_path: str) -> None:
+            _dbg(f"_on_dropped (welcome): {raw_path!r}  isdir={os.path.isdir(raw_path)}")
             if os.path.isdir(raw_path):
                 files = _scan_folder(raw_path)
+                _dbg(f"_on_dropped (welcome): scan found {len(files)} files")
                 if not files:
-                    print(f"No .graph files found in: {raw_path}")
                     return
                 result_path[0]     = files[0]
                 result_playlist[0] = files
             else:
                 result_path[0] = raw_path
+            _dbg("_on_dropped (welcome): calling TerminateApp")
             _get_iren().TerminateApp()
 
-        if _setup_win32_dnd(pl.render_window, _on_dropped):
+        ok = _setup_win32_dnd(pl.render_window, _on_dropped)
+        _dbg(f"_on_render_start (welcome): _setup_win32_dnd returned {ok}")
+        if ok:
             _dnd_ready[0] = True
 
     pl.render_window.AddObserver("StartEvent", _on_render_start)
@@ -1036,15 +1058,18 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
             _get_iren().TerminateApp()
 
     def _open_folder():
+        _dbg("_open_folder (welcome): called")
         folder = _pick_folder_dialog()
         if not folder:
+            _dbg("_open_folder (welcome): no folder selected")
             return
         files = _scan_folder(folder)
+        _dbg(f"_open_folder (welcome): folder={folder!r}  files={len(files)}")
         if not files:
-            print(f"No .graph files found in: {folder}")
             return
         result_path[0]     = files[0]
         result_playlist[0] = files
+        _dbg(f"_open_folder (welcome): calling TerminateApp, first={files[0]!r}")
         _get_iren().TerminateApp()
 
     pl.add_key_event("o", _open_file)
@@ -1064,6 +1089,17 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
 
 def main() -> None:
     import sys
+    import datetime
+
+    # Clear the debug log at start of each run for a clean read
+    _dbg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug.log")
+    try:
+        with open(_dbg_path, "w", encoding="utf-8") as _f:
+            _f.write(f"=== run {datetime.datetime.now()} ===\n")
+    except Exception:
+        pass
+
+    _dbg(f"main: argv={sys.argv}")
 
     show_labels = "--labels" in sys.argv
     cli_args    = [a for a in sys.argv[1:] if not a.startswith("-")]
@@ -1078,6 +1114,7 @@ def main() -> None:
             path     = raw
     else:
         path, playlist = _welcome_screen()
+        _dbg(f"main: welcome returned path={path!r}  playlist_len={len(playlist) if playlist else 0}")
 
     while path:
         try:
@@ -1094,10 +1131,12 @@ def main() -> None:
             except ValueError:
                 pass
 
+        _dbg(f"main: calling visualize  path={path!r}  playlist_len={len(playlist) if playlist else 0}")
         path, playlist = visualize(
             graph, title=path, show_labels=show_labels,
             playlist=playlist, playlist_idx=pl_idx,
         )
+        _dbg(f"main: visualize returned path={path!r}")
 
 
 if __name__ == "__main__":
