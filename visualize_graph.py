@@ -39,6 +39,64 @@ except ImportError as exc:
 
 
 # ---------------------------------------------------------------------------
+# Win32 drag-and-drop helper (no extra dependencies – pure ctypes)
+# ---------------------------------------------------------------------------
+
+def _setup_win32_dnd(render_window, on_file_callback) -> bool:
+    """
+    Subclass the VTK render window's Win32 message handler so that dropping
+    a file onto the window calls on_file_callback(path: str).
+    Must be called after the window is realized (i.e. from a RenderEvent cb).
+    Returns True on success, False on non-Windows or on error.
+    """
+    import sys
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        WM_DROPFILES = 0x0233
+        GWL_WNDPROC  = -4
+
+        shell32 = ctypes.windll.shell32
+        user32  = ctypes.windll.user32
+
+        hwnd = render_window.GetGenericWindowId()
+        if not hwnd:
+            return False
+
+        WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_size_t,  ctypes.c_ssize_t,
+        )
+        user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+        old_ptr = user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+        shell32.DragAcceptFiles(hwnd, True)
+
+        def _proc(h, msg, wp, lp):
+            if msg == WM_DROPFILES:
+                buf = ctypes.create_unicode_buffer(260)
+                if shell32.DragQueryFileW(ctypes.c_void_p(wp), 0, buf, 260):
+                    try:
+                        on_file_callback(buf.value)
+                    except Exception:
+                        pass
+                shell32.DragFinish(ctypes.c_void_p(wp))
+                return 0
+            return user32.CallWindowProcW(old_ptr, h, msg, wp, lp)
+
+        cb = WNDPROC(_proc)
+        render_window.__dnd_cb = cb   # keep a reference to prevent GC
+        user32.SetWindowLongPtrW(hwnd, GWL_WNDPROC, cb)
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Layer 1: Data model & parser
 # ---------------------------------------------------------------------------
 
@@ -498,30 +556,24 @@ def visualize(
             _raw.AddObserver("MouseMoveEvent", _on_mouse_move)
 
     # ------------------------------------------------------------------ #
-    #  Drag-and-drop: drop a new file to reload                           #
+    #  Drag-and-drop: drop a new file onto the window to reload           #
     # ------------------------------------------------------------------ #
     def _get_iren():
         iren = plotter.iren
         return getattr(iren, "interactor", None) or getattr(iren, "_iren", None) or iren
 
-    try:
-        plotter.render_window.SetAcceptDrop(True)
-    except Exception:
-        pass
+    _dnd_ready = [False]
 
-    def _on_file_drop(obj, event):
-        try:
-            files = _get_iren().GetDroppedFiles()
-            if files and files.GetNumberOfValues() > 0:
-                _next_file[0] = files.GetValue(0).strip()
-                _get_iren().TerminateApp()
-        except Exception as exc:
-            print(f"Drop error: {exc}")
+    def _on_render_start(obj, event):
+        if _dnd_ready[0]:
+            return
+        _dnd_ready[0] = True
+        def _on_dropped(path):
+            _next_file[0] = path
+            _get_iren().TerminateApp()
+        _setup_win32_dnd(plotter.render_window, _on_dropped)
 
-    try:
-        _get_iren().AddObserver("DropFilesEvent", _on_file_drop)
-    except Exception:
-        pass
+    plotter.render_window.AddObserver("StartEvent", _on_render_start)
 
     # ------------------------------------------------------------------ #
     #  View preset keyboard shortcuts                                      #
@@ -679,13 +731,12 @@ def _welcome_screen() -> Optional[str]:
         position="upper_edge",
         font_size=16,
         color="white",
-        bold=True,
     )
     pl.add_text(
         "Drop a graph file (.txt / .json) onto this window\n\n"
         "Press  O  to browse for a file\n\n"
         "Press  Q  to quit",
-        position="center",
+        position="lower_edge",
         font_size=12,
         color="#AAAAAA",
     )
@@ -696,24 +747,18 @@ def _welcome_screen() -> Optional[str]:
         iren = pl.iren
         return getattr(iren, "interactor", None) or getattr(iren, "_iren", None) or iren
 
-    try:
-        pl.render_window.SetAcceptDrop(True)
-    except Exception:
-        pass
+    _dnd_ready = [False]
 
-    def _on_drop(obj, event):
-        try:
-            files = _get_iren().GetDroppedFiles()
-            if files and files.GetNumberOfValues() > 0:
-                result[0] = files.GetValue(0).strip()
-                _get_iren().TerminateApp()
-        except Exception as exc:
-            print(f"Drop error: {exc}")
+    def _on_render_start(obj, event):
+        if _dnd_ready[0]:
+            return
+        _dnd_ready[0] = True
+        def _on_dropped(path):
+            result[0] = path
+            _get_iren().TerminateApp()
+        _setup_win32_dnd(pl.render_window, _on_dropped)
 
-    try:
-        _get_iren().AddObserver("DropFilesEvent", _on_drop)
-    except Exception:
-        pass
+    pl.render_window.AddObserver("StartEvent", _on_render_start)
 
     def _on_open():
         path = _open_file_dialog()
