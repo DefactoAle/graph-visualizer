@@ -521,6 +521,7 @@ def visualize(
     actors: dict[str, list] = {
         "faces": [], "edges": [], "bend_edges": [],
         "vertices": [], "labels": [], "bend_annots": [],
+        "x_axis": [],
     }
     _lbl_actors: list = []   # add_point_labels actors removed manually on rebuild
 
@@ -563,11 +564,24 @@ def visualize(
     _hover_last: list[str] = [""]
 
     # ------------------------------------------------------------------ #
+    #  Always-visible 3-D cursor coordinate display (bottom-left)        #
+    # ------------------------------------------------------------------ #
+    _coord_actor = vtk.vtkTextActor()
+    _coord_actor.SetInput("X: ---  Y: ---  Z: --- mm")
+    _coord_actor.GetTextProperty().SetFontSize(12)
+    _coord_actor.GetTextProperty().SetColor(0.05, 0.05, 0.05)
+    _coord_actor.GetTextProperty().SetBackgroundColor(0.96, 0.98, 1.0)
+    _coord_actor.GetTextProperty().SetBackgroundOpacity(0.80)
+    _coord_actor.GetPositionCoordinate().SetCoordinateSystemToDisplay()
+    _coord_actor.SetPosition(10, 10)
+    plotter.renderer.AddActor2D(_coord_actor)
+
+    # ------------------------------------------------------------------ #
     #  Graph build / rebuild (called once at start and on navigation)    #
     # ------------------------------------------------------------------ #
     def _build_graph(g: SheetMetalGraph, path: str) -> None:
         # Remove named mesh actors
-        for _name in ("faces", "edges", "bend_edges", "vertices"):
+        for _name in ("faces", "edges", "bend_edges", "vertices", "x_axis"):
             try:
                 plotter.remove_actor(_name)
             except Exception:
@@ -684,6 +698,13 @@ def visualize(
         if bad_faces:
             print(f"WARNING: {len(bad_faces)} malformed face(s) skipped: {bad_faces}")
 
+        # -- X-axis reference line (3 m = 3000 mm, centered at origin) --
+        x_line = pv.Line((-1500.0, 0.0, 0.0), (1500.0, 0.0, 0.0))
+        actors["x_axis"].append(plotter.add_mesh(
+            x_line, color="#CC2222", line_width=2.5,
+            pickable=False, name="x_axis",
+        ))
+
         plotter.reset_camera()
 
     # ---- Initial build ----
@@ -699,6 +720,7 @@ def visualize(
         ("vertices",    "Vertices",    True,        "#3366AA"),
         ("labels",      "Labels",      show_labels, "#333333"),
         ("bend_annots", "Bend Annots", True,        "#C05000"),
+        ("x_axis",      "X-Axis Line", True,        "#CC2222"),
     ]
     CB_SIZE, CB_GAP = 25, 5
     _start_y = _WIN_H - 100
@@ -748,6 +770,27 @@ def visualize(
         _hover_picker.Pick(x, y, 0, _hover_renderer)
         pid  = _hover_picker.GetPointId()
         dset = _hover_picker.GetDataSet()
+
+        # --- 3-D world-space cursor coordinates (always shown) ---
+        if dset is not None and pid >= 0:
+            wx, wy, wz = _hover_picker.GetPickPosition()
+        else:
+            # Project mouse onto the camera focal plane for a meaningful 3-D pos
+            cam = _hover_renderer.GetActiveCamera()
+            fp  = cam.GetFocalPoint()
+            _hover_renderer.SetWorldPoint(fp[0], fp[1], fp[2], 1.0)
+            _hover_renderer.WorldToDisplay()
+            dz = _hover_renderer.GetDisplayPoint()[2]
+            _hover_renderer.SetDisplayPoint(x, y, dz)
+            _hover_renderer.DisplayToWorld()
+            wp = _hover_renderer.GetWorldPoint()
+            if wp[3] != 0.0:
+                wx, wy, wz = wp[0] / wp[3], wp[1] / wp[3], wp[2] / wp[3]
+            else:
+                wx, wy, wz = 0.0, 0.0, 0.0
+        _coord_actor.SetInput(f"X: {wx:.2f}  Y: {wy:.2f}  Z: {wz:.2f} mm")
+
+        # --- Hover inspection ---
         new_text = ""
         if dset is not None and pid >= 0:
             pd      = dset.GetPointData()
