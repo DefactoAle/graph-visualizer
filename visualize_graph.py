@@ -974,26 +974,61 @@ _REQUIRED_GRAPH_KEYS = [
 
 
 def _load_graph(path: str) -> SheetMetalGraph:
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        raise SystemExit(f"ERROR: File not found: '{path}'")
-    except json.JSONDecodeError as exc:
-        raise SystemExit(f"ERROR: Invalid JSON in '{path}': {exc}")
+    # Try encodings in order — Windows often saves files as CP-1252, not UTF-8
+    raw = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            with open(path, encoding=enc) as f:
+                raw = json.load(f)
+            break
+        except FileNotFoundError:
+            raise SystemExit(f"ERROR: File not found:\n{path}")
+        except PermissionError:
+            raise SystemExit(f"ERROR: Permission denied reading:\n{path}")
+        except UnicodeDecodeError:
+            continue
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"ERROR: Invalid JSON in:\n{path}\n\n{exc}")
+        except OSError as exc:
+            raise SystemExit(f"ERROR: Cannot open '{path}':\n{exc}")
+
+    if raw is None:
+        raise SystemExit(
+            f"ERROR: Could not decode '{os.path.basename(path)}'.\n"
+            "Tried utf-8, cp1252, latin-1 — file may be corrupt."
+        )
 
     if "Graph" not in raw:
         raise SystemExit(
-            f"ERROR: JSON root must contain a 'Graph' key.  "
+            f"ERROR: JSON root must contain a 'Graph' key.\n"
             f"Keys found: {list(raw.keys())}"
         )
     graph_dict = raw["Graph"]
     missing = [k for k in _REQUIRED_GRAPH_KEYS if k not in graph_dict]
     if missing:
         raise SystemExit(
-            f"ERROR: 'Graph' section is missing required keys: {missing}"
+            f"ERROR: 'Graph' section is missing required keys:\n{missing}"
         )
-    return SheetMetalGraph.from_dict(graph_dict)
+    try:
+        return SheetMetalGraph.from_dict(graph_dict)
+    except Exception as exc:
+        raise SystemExit(
+            f"ERROR: Failed to parse graph data in:\n{path}\n\n{exc}"
+        ) from exc
+
+
+def _show_error(message: str) -> None:
+    """Show a blocking error dialog — works even in .pyw (no console) mode."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showerror("Graph Load Error", message)
+        root.destroy()
+    except Exception:
+        pass
 
 
 def _pick_file_dialog() -> Optional[str]:
@@ -1177,8 +1212,11 @@ def main() -> None:
     while path:
         try:
             graph = _load_graph(path)
-        except SystemExit as exc:
-            print(exc)
+        except (SystemExit, Exception) as exc:
+            msg = str(exc).replace("SystemExit: ", "")
+            _dbg(f"load error: {msg}")
+            print(msg)
+            _show_error(msg)
             path, playlist = _welcome_screen()
             continue
 
