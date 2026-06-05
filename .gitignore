@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VS generated
+.vs/
+
+# Runtime output
+debug.log
+sheet_metal_*.png
