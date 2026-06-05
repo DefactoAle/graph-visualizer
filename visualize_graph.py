@@ -974,9 +974,12 @@ _REQUIRED_GRAPH_KEYS = [
 
 
 def _load_graph(path: str) -> SheetMetalGraph:
-    # Try encodings in order — Windows often saves files as CP-1252, not UTF-8
+    # Try encodings in order.  Treat both UnicodeDecodeError AND JSONDecodeError
+    # as "wrong encoding, keep trying" — a UTF-16 file opened as cp1252 decodes
+    # without error but produces garbled content that fails JSON parsing at char 0.
     raw = None
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+    _enc_errors: list[str] = []
+    for enc in ("utf-8-sig", "utf-8", "utf-16", "cp1252", "latin-1"):
         try:
             with open(path, encoding=enc) as f:
                 raw = json.load(f)
@@ -985,17 +988,18 @@ def _load_graph(path: str) -> SheetMetalGraph:
             raise SystemExit(f"ERROR: File not found:\n{path}")
         except PermissionError:
             raise SystemExit(f"ERROR: Permission denied reading:\n{path}")
-        except UnicodeDecodeError:
-            continue
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"ERROR: Invalid JSON in:\n{path}\n\n{exc}")
         except OSError as exc:
-            raise SystemExit(f"ERROR: Cannot open '{path}':\n{exc}")
+            raise SystemExit(f"ERROR: Cannot open file:\n{path}\n\n{exc}")
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            _enc_errors.append(f"  {enc}: {exc}")
+            continue
 
     if raw is None:
+        detail = "\n".join(_enc_errors[:3])
         raise SystemExit(
-            f"ERROR: Could not decode '{os.path.basename(path)}'.\n"
-            "Tried utf-8, cp1252, latin-1 — file may be corrupt."
+            f"ERROR: '{os.path.basename(path)}' could not be parsed as JSON.\n\n"
+            f"Tried encodings: utf-8, utf-16, cp1252, latin-1.\n"
+            f"The file may not be a valid graph file.\n\n{detail}"
         )
 
     if "Graph" not in raw:
