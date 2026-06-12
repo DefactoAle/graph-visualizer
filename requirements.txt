@@ -1,2 +1,5 @@
 pyvista[all]>=0.44
 numpy>=1.21
+
+# Optional — enables PostgreSQL / AutoAbsDB mode (D key in welcome screen)
+# psycopg2-binary>=2.9

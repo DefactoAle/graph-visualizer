@@ -39,6 +39,16 @@ except ImportError as exc:
         "Run:  pip install \"pyvista[all]\" numpy"
     )
 
+try:
+    import psycopg2
+    _HAS_PSYCOPG2 = True
+except ImportError:
+    _HAS_PSYCOPG2 = False
+
+_DB_NAME       = "AutoAbsDB"
+_DB_TABLE      = "Bends"
+_DB_JSON_FIELD = "GraphJson"
+
 
 # ---------------------------------------------------------------------------
 # Debug logger — writes to debug.log (visible even in .pyw / no-console mode)
@@ -1035,6 +1045,232 @@ def _show_error(message: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL / database support
+# ---------------------------------------------------------------------------
+
+def _config_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "graph_visualizer_config.json")
+
+
+def _load_db_config() -> dict:
+    try:
+        with open(_config_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_db_config(cfg: dict) -> None:
+    try:
+        with open(_config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+def _parse_graph_json(json_val) -> "SheetMetalGraph":
+    """Parse a GraphJson value (str or dict) into a SheetMetalGraph.
+    Handles both the full {\"Graph\":{...}} wrapper and the bare graph dict."""
+    if isinstance(json_val, str):
+        try:
+            raw = json.loads(json_val)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"ERROR: GraphJson is not valid JSON:\n{exc}")
+    elif isinstance(json_val, dict):
+        raw = json_val
+    else:
+        raise SystemExit(f"ERROR: Unexpected GraphJson type: {type(json_val)}")
+
+    graph_dict = raw.get("Graph", raw)   # support both wrapper and bare dict
+
+    missing = [k for k in _REQUIRED_GRAPH_KEYS if k not in graph_dict]
+    if missing:
+        raise SystemExit(f"ERROR: GraphJson is missing required keys:\n{missing}")
+    try:
+        return SheetMetalGraph.from_dict(graph_dict)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: Failed to parse GraphJson:\n{exc}") from exc
+
+
+def _show_db_config_dialog(existing: dict) -> Optional[dict]:
+    """Tkinter dialog for PostgreSQL credentials.  Returns cfg dict or None."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    result: list[Optional[dict]] = [None]
+    root = tk.Tk()
+    root.title(f"Connect to {_DB_NAME}")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    pad = {"padx": 8, "pady": 4}
+    ttk.Label(root, text="Host:").grid(    row=0, column=0, sticky="e", **pad)
+    ttk.Label(root, text="Port:").grid(    row=1, column=0, sticky="e", **pad)
+    ttk.Label(root, text="User:").grid(    row=2, column=0, sticky="e", **pad)
+    ttk.Label(root, text="Password:").grid(row=3, column=0, sticky="e", **pad)
+
+    var_host = tk.StringVar(value=existing.get("db_host", "localhost"))
+    var_port = tk.StringVar(value=str(existing.get("db_port", 5432)))
+    var_user = tk.StringVar(value=existing.get("db_user", "postgres"))
+    var_pass = tk.StringVar(value=existing.get("db_password", ""))
+
+    ttk.Entry(root, textvariable=var_host, width=30).grid(row=0, column=1, **pad)
+    ttk.Entry(root, textvariable=var_port, width=30).grid(row=1, column=1, **pad)
+    ttk.Entry(root, textvariable=var_user, width=30).grid(row=2, column=1, **pad)
+    ttk.Entry(root, textvariable=var_pass, show="*", width=30).grid(row=3, column=1, **pad)
+
+    def _on_ok():
+        try:
+            port = int(var_port.get())
+        except ValueError:
+            messagebox.showerror("Invalid port", "Port must be a number.", parent=root)
+            return
+        result[0] = {
+            "db_host":     var_host.get().strip(),
+            "db_port":     port,
+            "db_user":     var_user.get().strip(),
+            "db_password": var_pass.get(),
+        }
+        root.destroy()
+
+    btn = ttk.Frame(root)
+    btn.grid(row=4, column=0, columnspan=2, pady=8)
+    ttk.Button(btn, text="Connect", command=_on_ok          ).pack(side="left", padx=4)
+    ttk.Button(btn, text="Cancel",  command=root.destroy    ).pack(side="left", padx=4)
+    root.bind("<Return>", lambda _e: _on_ok())
+    root.bind("<Escape>", lambda _e: root.destroy())
+
+    root.update_idletasks()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w, h   = root.winfo_reqwidth(),    root.winfo_reqheight()
+    root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 2}")
+    root.mainloop()
+    return result[0]
+
+
+def _db_connect(cfg: dict):
+    """Return an open psycopg2 connection, or raise RuntimeError."""
+    if not _HAS_PSYCOPG2:
+        raise RuntimeError(
+            "psycopg2 is not installed.\n\nRun:  pip install psycopg2-binary"
+        )
+    try:
+        return psycopg2.connect(
+            host=cfg["db_host"],
+            port=int(cfg["db_port"]),
+            dbname=_DB_NAME,
+            user=cfg["db_user"],
+            password=cfg["db_password"],
+            connect_timeout=8,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Connection to {_DB_NAME} failed:\n{exc}") from exc
+
+
+def _show_db_records_dialog(conn) -> Optional["SheetMetalGraph"]:
+    """Browse the Bends table and return the selected row's graph, or None."""
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    try:
+        cur = conn.cursor()
+        # Discover column order
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s ORDER BY ordinal_position",
+            (_DB_TABLE,),
+        )
+        all_cols    = [r[0] for r in cur.fetchall()]
+        display_cols = [c for c in all_cols if c != _DB_JSON_FIELD] or all_cols[:1]
+
+        select_expr = ", ".join(
+            [f'"{c}"' for c in display_cols]
+            + ([f'"{_DB_JSON_FIELD}"'] if _DB_JSON_FIELD in all_cols else [])
+        )
+        sort_col = display_cols[0]
+        cur.execute(
+            f'SELECT {select_expr} FROM "{_DB_TABLE}" '
+            f'WHERE "{_DB_JSON_FIELD}" IS NOT NULL '
+            f"AND \"{_DB_JSON_FIELD}\" <> '' "
+            f'ORDER BY "{sort_col}" DESC LIMIT 200'
+        )
+        raw_rows   = cur.fetchall()
+        col_names  = [d[0] for d in cur.description]
+        rows       = [dict(zip(col_names, r)) for r in raw_rows]
+        cur.close()
+    except Exception as exc:
+        _show_error(f"Failed to query {_DB_TABLE}:\n{exc}")
+        return None
+
+    if not rows:
+        _show_error(f"No {_DB_JSON_FIELD} data found in {_DB_TABLE}.")
+        return None
+
+    result: list[Optional[SheetMetalGraph]] = [None]
+
+    root = tk.Tk()
+    root.title(f"{_DB_NAME} › {_DB_TABLE}  —  {len(rows)} records")
+    root.attributes("-topmost", True)
+    root.geometry("800x460")
+
+    frm = ttk.Frame(root)
+    frm.pack(fill="both", expand=True, padx=8, pady=(8, 2))
+
+    col_w = max(80, 740 // max(len(display_cols), 1))
+    tree  = ttk.Treeview(frm, columns=display_cols, show="headings",
+                          selectmode="browse")
+    for c in display_cols:
+        tree.heading(c, text=c)
+        tree.column(c, width=col_w, anchor="w")
+
+    vsb = ttk.Scrollbar(frm, orient="vertical",   command=tree.yview)
+    hsb = ttk.Scrollbar(frm, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    frm.rowconfigure(0, weight=1)
+    frm.columnconfigure(0, weight=1)
+
+    for row in rows:
+        tree.insert("", "end", values=[str(row.get(c, "")) for c in display_cols])
+
+    # Select first row by default
+    children = tree.get_children()
+    if children:
+        tree.selection_set(children[0])
+        tree.focus(children[0])
+
+    def _on_load():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showwarning("No selection", "Select a row first.", parent=root)
+            return
+        json_val = rows[tree.index(sel[0])].get(_DB_JSON_FIELD)
+        if not json_val:
+            messagebox.showerror("Empty", f"{_DB_JSON_FIELD} is empty.", parent=root)
+            return
+        try:
+            result[0] = _parse_graph_json(json_val)
+        except SystemExit as exc:
+            messagebox.showerror("Parse error", str(exc), parent=root)
+            return
+        root.destroy()
+
+    btn_frm = ttk.Frame(root)
+    btn_frm.pack(pady=6)
+    ttk.Button(btn_frm, text="Load selected", command=_on_load    ).pack(side="left", padx=4)
+    ttk.Button(btn_frm, text="Cancel",        command=root.destroy).pack(side="left", padx=4)
+
+    tree.bind("<Double-1>", lambda _e: _on_load())
+    root.bind("<Return>",   lambda _e: _on_load())
+    root.bind("<Escape>",   lambda _e: root.destroy())
+    root.mainloop()
+    return result[0]
+
+
 def _pick_file_dialog() -> Optional[str]:
     """Native OS file-open dialog.  Returns selected path or None."""
     try:
@@ -1101,21 +1337,26 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
 
     # Instructions — centred, placed in the lower half of the window
     _ia = _vtk.vtkTextActor()
-    _ia.SetInput(
+    _instr = (
         "Drop a .graph file or folder onto this window\n\n"
         "O  =  open file        F  =  open folder\n\n"
-        "Q  =  quit"
     )
+    if _HAS_PSYCOPG2:
+        _cfg_hint = " (saved)" if _load_db_config().get("db_host") else ""
+        _instr += f"D  =  connect to database{_cfg_hint}\n\n"
+    _instr += "Q  =  quit"
+    _ia.SetInput(_instr)
     _ia.GetPositionCoordinate().SetCoordinateSystemToNormalizedDisplay()
-    _ia.SetPosition(0.5, 0.28)
+    _ia.SetPosition(0.5, 0.22)
     _ip = _ia.GetTextProperty()
     _ip.SetFontSize(12)
     _ip.SetColor(0.67, 0.67, 0.67)
     _ip.SetJustificationToCentered()
     pl.renderer.AddActor2D(_ia)
 
-    result_path:     list[Optional[str]]        = [None]
-    result_playlist: list[Optional[list[str]]]  = [None]
+    result_path:     list[Optional[str]]             = [None]
+    result_playlist: list[Optional[list[str]]]       = [None]
+    result_graph:    list[Optional[SheetMetalGraph]] = [None]
 
     def _get_iren():
         iren = pl.iren
@@ -1169,10 +1410,44 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
         _dbg(f"_open_folder (welcome): calling TerminateApp, first={files[0]!r}")
         _get_iren().TerminateApp()
 
+    def _open_db():
+        if not _HAS_PSYCOPG2:
+            _show_error("psycopg2 is not installed.\n\nRun:  pip install psycopg2-binary")
+            return
+        cfg  = _load_db_config()
+        conn = None
+        # Try saved credentials first; fall back to config dialog on failure
+        if cfg.get("db_host"):
+            try:
+                conn = _db_connect(cfg)
+            except RuntimeError:
+                conn = None
+        if conn is None:
+            new_cfg = _show_db_config_dialog(cfg)
+            if new_cfg is None:
+                return
+            try:
+                conn = _db_connect(new_cfg)
+            except RuntimeError as exc:
+                _show_error(str(exc))
+                return
+            cfg = new_cfg
+        _save_db_config(cfg)
+        graph = _show_db_records_dialog(conn)
+        conn.close()
+        if graph is None:
+            return
+        result_graph[0] = graph
+        result_path[0]  = f"[DB] {_DB_NAME} › {_DB_TABLE}"
+        _get_iren().TerminateApp()
+
     pl.add_key_event("o", _open_file)
     pl.add_key_event("O", _open_file)
     pl.add_key_event("f", _open_folder)
     pl.add_key_event("F", _open_folder)
+    if _HAS_PSYCOPG2:
+        pl.add_key_event("d", _open_db)
+        pl.add_key_event("D", _open_db)
 
     pl.show(auto_close=False)
     try:
@@ -1181,7 +1456,7 @@ def _welcome_screen() -> tuple[Optional[str], Optional[list[str]]]:
         pass
 
     pv.global_theme.background = "white"
-    return result_path[0], result_playlist[0]
+    return result_path[0], result_playlist[0], result_graph[0]
 
 
 def main() -> None:
@@ -1201,6 +1476,8 @@ def main() -> None:
     show_labels = "--labels" in sys.argv
     cli_args    = [a for a in sys.argv[1:] if not a.startswith("-")]
 
+    preloaded: Optional[SheetMetalGraph] = None
+
     if cli_args:
         raw = cli_args[0]
         if os.path.isdir(raw):
@@ -1210,22 +1487,26 @@ def main() -> None:
             playlist = None
             path     = raw
     else:
-        path, playlist = _welcome_screen()
+        path, playlist, preloaded = _welcome_screen()
         _dbg(f"main: welcome returned path={path!r}  playlist_len={len(playlist) if playlist else 0}")
 
-    while path:
-        try:
-            graph = _load_graph(path)
-        except (SystemExit, Exception) as exc:
-            msg = str(exc).replace("SystemExit: ", "")
-            _dbg(f"load error: {msg}")
-            print(msg)
-            _show_error(msg)
-            path, playlist = _welcome_screen()
-            continue
+    while path or preloaded:
+        if preloaded:
+            graph     = preloaded
+            preloaded = None
+        else:
+            try:
+                graph = _load_graph(path)
+            except (SystemExit, Exception) as exc:
+                msg = str(exc).replace("SystemExit: ", "")
+                _dbg(f"load error: {msg}")
+                print(msg)
+                _show_error(msg)
+                path, playlist, preloaded = _welcome_screen()
+                continue
 
         pl_idx = 0
-        if playlist:
+        if playlist and path:
             try:
                 pl_idx = playlist.index(path)
             except ValueError:
@@ -1233,7 +1514,7 @@ def main() -> None:
 
         _dbg(f"main: calling visualize  path={path!r}  playlist_len={len(playlist) if playlist else 0}")
         path, playlist = visualize(
-            graph, title=path, show_labels=show_labels,
+            graph, title=path or "", show_labels=show_labels,
             playlist=playlist, playlist_idx=pl_idx,
         )
         _dbg(f"main: visualize returned path={path!r}")
